@@ -9,6 +9,7 @@ import functools
 import itertools
 import hashlib
 import weakref
+import decimal
 from collections import defaultdict
 try:
     # Python 3.8+ https://docs.python.org/3/whatsnew/3.7.html#id3
@@ -2202,6 +2203,10 @@ class FakeSocket(object):
     def dbsize(self):
         return len(self._db)
 
+    @command(())
+    def time(self):
+        return _time()
+
     @command((), (bytes,))
     def flushdb(self, *args):
         if args:
@@ -2622,3 +2627,7 @@ class FakeStrictRedis(FakeRedisMixin, redis.StrictRedis):
 
 class FakeRedis(FakeRedisMixin, redis.Redis):
     pass
+
+def _time():
+    ts_bytes = bytes("%.6f" % decimal.Decimal(time.time()))
+    return map(int, ts_bytes.split("."))
