@@ -1,9 +1,9 @@
-from __future__ import print_function, division, absolute_import
 import operator
 import functools
 
 import hypothesis
 import hypothesis.stateful
+from hypothesis.stateful import rule, initialize, precondition
 import hypothesis.strategies as st
 import pytest
 import redis
@@ -47,7 +47,7 @@ expires_seconds = st.integers(min_value=100000, max_value=10000000000)
 expires_ms = st.integers(min_value=100000000, max_value=10000000000000)
 
 
-class WrappedException(object):
+class WrappedException:
     """Wraps an exception for the purposes of comparison."""
     def __init__(self, exc):
         self.wrapped = exc
@@ -56,7 +56,7 @@ class WrappedException(object):
         return str(self.wrapped)
 
     def __repr__(self):
-        return 'WrappedException({0!r})'.format(self.wrapped)
+        return 'WrappedException({!r})'.format(self.wrapped)
 
     def __eq__(self, other):
         if not isinstance(other, WrappedException):
@@ -92,8 +92,7 @@ def sort_list(lst):
 def flatten(args):
     if isinstance(args, (list, tuple)):
         for arg in args:
-            for item in flatten(arg):
-                yield item
+            yield from flatten(arg)
     elif args is not None:
         yield args
 
@@ -102,7 +101,7 @@ def default_normalize(x):
     return x
 
 
-class Command(object):
+class Command:
     def __init__(self, *args):
         self.args = tuple(flatten(args))
 
@@ -142,7 +141,17 @@ class Command(object):
         if N == 0:
             return False
         command = self.encode(self.args[0]).lower()
+        if not command.split():
+            return False
         if command == b'keys' and N == 2 and self.args[1] != b'*':
+            return False
+        # redis will ignore a NUL character in some commands but not others
+        # e.g. it recognises EXEC\0 but not MULTI\00. Rather than try to
+        # reproduce this quirky behaviour, just skip these tests.
+        if b'\0' in command:
+            return False
+        # 'incr' flag to zadd not implemented yet
+        if command == b'zadd' and 'incr' in self.args:
             return False
         return True
 
@@ -340,17 +349,21 @@ bad_commands = (
              st.lists(st.binary() | st.text()))
 )
 
+attrs = st.fixed_dictionaries({
+    'keys': st.lists(st.binary(), min_size=2, max_size=5, unique=True),
+    'fields': st.lists(st.binary(), min_size=2, max_size=5, unique=True),
+    'values': st.lists(st.binary() | int_as_bytes | float_as_bytes,
+                       min_size=2, max_size=5, unique=True),
+    'scores': st.lists(st.floats(width=32), min_size=2, max_size=5, unique=True)
+})
 
-@hypothesis.settings(max_examples=1000, timeout=hypothesis.unlimited)
-class CommonMachine(hypothesis.stateful.GenericStateMachine):
-    create_command_strategy = None
 
-    STATE_EMPTY = 0
-    STATE_INIT = 1
-    STATE_RUNNING = 2
+@hypothesis.settings(max_examples=1000)
+class CommonMachine(hypothesis.stateful.RuleBasedStateMachine):
+    create_command_strategy = st.nothing()
 
     def __init__(self):
-        super(CommonMachine, self).__init__()
+        super().__init__()
         self.fake = fakeredis.FakeStrictRedis()
         try:
             self.real = redis.StrictRedis('localhost', port=6379)
@@ -365,7 +378,7 @@ class CommonMachine(hypothesis.stateful.GenericStateMachine):
         self.fields = []
         self.values = []
         self.scores = []
-        self.state = self.STATE_EMPTY
+        self.initialized_data = False
         try:
             self.real.execute_command('discard')
         except redis.ResponseError:
@@ -375,7 +388,7 @@ class CommonMachine(hypothesis.stateful.GenericStateMachine):
     def teardown(self):
         self.real.connection_pool.disconnect()
         self.fake.connection_pool.disconnect()
-        super(CommonMachine, self).teardown()
+        super().teardown()
 
     def _evaluate(self, client, command):
         try:
@@ -394,17 +407,16 @@ class CommonMachine(hypothesis.stateful.GenericStateMachine):
         if fake_exc is not None and real_exc is None:
             raise fake_exc
         elif real_exc is not None and fake_exc is None:
-            assert real_exc == fake_exc, "Expected exception {0} not raised".format(real_exc)
+            assert real_exc == fake_exc, "Expected exception {} not raised".format(real_exc)
         elif (real_exc is None and isinstance(real_result, list)
               and command.args and command.args[0].lower() == 'exec'):
+            assert fake_result is not None
             # Transactions need to use the normalize functions of the
             # component commands.
             assert len(self.transaction_normalize) == len(real_result)
             assert len(self.transaction_normalize) == len(fake_result)
             for n, r, f in zip(self.transaction_normalize, real_result, fake_result):
                 assert n(f) == n(r)
-            self.transaction_normalize = []
-        elif real_exc is None and command.args and command.args[0].lower() == 'discard':
             self.transaction_normalize = []
         else:
             assert fake_result == real_result
@@ -414,45 +426,37 @@ class CommonMachine(hypothesis.stateful.GenericStateMachine):
                 # transaction. But it is extremely unlikely that hypothesis will
                 # find such examples.
                 self.transaction_normalize.append(command.normalize)
+        if (len(command.args) == 1
+                and Command.encode(command.args[0]).lower() in (b'discard', b'exec')):
+            self.transaction_normalize = []
 
-    def _init_attrs(self, attrs):
+    @initialize(attrs=attrs)
+    def init_attrs(self, attrs):
         for key, value in attrs.items():
             setattr(self, key, value)
 
-    def _init_data(self, init_commands):
-        for command in init_commands:
+    # hypothesis doesn't allow ordering of @initialize, so we have to put
+    # preconditions on rules to ensure we call init_data exactly once and
+    # after init_attrs.
+    @precondition(lambda self: not self.initialized_data)
+    @rule(commands=self_strategy.flatmap(
+        lambda self: st.lists(self.create_command_strategy)))
+    def init_data(self, commands):
+        for command in commands:
             self._compare(command)
+        self.initialized_data = True
 
-    def steps(self):
-        if self.state == self.STATE_EMPTY:
-            attrs = {
-                'keys': st.lists(st.binary(), min_size=2, max_size=5, unique=True),
-                'fields': st.lists(st.binary(), min_size=2, max_size=5, unique=True),
-                'values': st.lists(st.binary() | int_as_bytes | float_as_bytes,
-                                   min_size=2, max_size=5, unique=True),
-                'scores': st.lists(st.floats(width=32), min_size=2, max_size=5, unique=True)
-            }
-            return st.fixed_dictionaries(attrs)
-        elif self.state == self.STATE_INIT:
-            return st.lists(self.create_command_strategy)
-        else:
-            return self.command_strategy
-
-    def execute_step(self, step):
-        if self.state == self.STATE_EMPTY:
-            self._init_attrs(step)
-            self.state = self.STATE_INIT if self.create_command_strategy else self.STATE_RUNNING
-        elif self.state == self.STATE_INIT:
-            self._init_data(step)
-            self.state = self.STATE_RUNNING
-        else:
-            self._compare(step)
+    @precondition(lambda self: self.initialized_data)
+    @rule(command=self_strategy.flatmap(lambda self: self.command_strategy))
+    def one_command(self, command):
+        self._compare(command)
 
 
-class BaseTest(object):
-    create_command_strategy = None
-
+class BaseTest:
     """Base class for test classes."""
+
+    create_command_strategy = st.nothing()
+
     @pytest.mark.slow
     def test(self):
         class Machine(CommonMachine):

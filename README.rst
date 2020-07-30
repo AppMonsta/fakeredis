@@ -17,7 +17,8 @@ many times you want to write unittests that do not talk to an external server
 module as a reasonable substitute for redis.
 
 Although fakeredis is pure Python, you will need lupa_ if you want to run Lua
-scripts. If you install fakeredis with ``pip install fakeredis[lua]`` it will
+scripts (this includes features like ``redis.lock.Lock``, which are implemented
+in Lua). If you install fakeredis with ``pip install fakeredis[lua]`` it will
 be automatically installed.
 
 .. _lupa: https://pypi.org/project/lupa/
@@ -25,12 +26,13 @@ be automatically installed.
 Alternatives
 ============
 
-Consider using birdisle_ instead of fakeredis. It embeds the redis codebase
-into a Python extension, so it implements the full redis command set and
-behaves far more closely to a real redis implementation. The disadvantage is
-that it currently only works on Linux.
+Consider using birdisle_ or redislite_ instead of fakeredis. They embed the redis codebase
+into Python, so they implement the full redis command set and
+behave far more similarly to a real redis implementation.
 
 .. _birdisle: https://birdisle.readthedocs.io/en/latest/
+.. _redislite: https://redislite.readthedocs.io/en/latest/
+
 
 
 How to Use
@@ -96,6 +98,32 @@ Fakeredis implements the same interface as `redis-py`_, the
 popular redis client for python, and models the responses
 of redis 5.0.
 
+Support for aioredis
+====================
+You can also use fakeredis to mock out aioredis_. This is a much newer
+addition (added in 1.4.0) with less testing, so your mileage may vary. For
+example:
+
+.. code-block:: python
+
+  >>> import fakeredis.aioredis
+  >>> r = await fakeredis.aioredis.create_redis_pool()
+  >>> await r.set('foo', 'bar')
+  True
+  >>> await r.get('foo')
+  b'bar'
+
+.. _aioredis: https://aioredis.readthedocs.io/
+
+You can pass a `FakeServer` as the first argument to `create_redis` or
+`create_redis_pool` to share state (you can even share state with a
+`fakeredis.FakeRedis`). It should even be safe to do this state sharing between
+threads (as long as each connection/pool is only used in one thread).
+
+It is highly recommended that you only use the aioredis support with
+Python 3.5.3 or higher. Earlier versions will not work correctly with
+non-default event loops.
+
 Porting to fakeredis 1.0
 ========================
 
@@ -109,7 +137,7 @@ that may require changes to your code:
    tests. If you need to share state between instances, create a FakeServer,
    as described above.
 
-2. FakeRedis is now a subclass of FakeStrictRedis, and similarly
+2. FakeRedis is now a subclass of Redis, and similarly
    FakeStrictRedis is a subclass of StrictRedis. Code that uses `isinstance`
    may behave differently.
 
@@ -304,7 +332,7 @@ bugs in Github.
    generally not produce the same results, and in Python versions before 3.6
    may produce different results each time the process is re-run.
 
-7. SCAN/ZSCAN/HSCAN/SSCAN will not necessary iterate all items if items are
+7. SCAN/ZSCAN/HSCAN/SSCAN will not necessarily iterate all items if items are
    deleted or renamed during iteration. They also won't necessarily iterate in
    the same chunk sizes or the same order as redis.
 
@@ -328,47 +356,90 @@ To ensure parity with the real redis, there are a set of integration tests
 that mirror the unittests.  For every unittest that is written, the same
 test is run against a real redis instance using a real redis-py client
 instance.  In order to run these tests you must have a redis server running
-on localhost, port 6379 (the default settings).  The integration tests use
-db=10 in order to minimize collisions with an existing redis instance.
+on localhost, port 6379 (the default settings). **WARNING**: the tests will
+completely wipe your database!
 
 
-To run all the tests, install the requirements file::
+First install the requirements file::
 
     pip install -r requirements.txt
 
-If you just want to run the unittests::
+To run all the tests::
 
-    pytest test_fakeredis.py::TestFakeStrictRedis test_fakeredis.py::TestFakeRedis
+    pytest
+
+If you only want to run tests against fake redis, without a real redis::
+
+    pytest -m fake
 
 Because this module is attempting to provide the same interface as `redis-py`_,
 the python bindings to redis, a reasonable way to test this to to take each
 unittest and run it against a real redis server.  fakeredis and the real redis
-server should give the same result.  This ensures parity between the two.  You
-can run these "integration" tests like this::
+server should give the same result. To run tests against a real redis instance
+instead::
 
-    pytest test_fakeredis.py::TestRealStrictRedis test_fakeredis.py::TestRealRedis test_fakeredis_hypothesis.py
-
-In terms of implementation, ``TestRealRedis`` is a subclass of
-``TestFakeRedis`` that overrides a factory method to create
-an instance of ``redis.Redis`` (an actual python client for redis)
-instead of ``fakeredis.FakeStrictRedis``.
-
-To run both the unittests and the "integration" tests, run::
-
-    pytest
+    pytest -m real
 
 If redis is not running and you try to run tests against a real redis server,
-these tests will have a result of 'S' for skipped.
+these tests will have a result of 's' for skipped.
 
 There are some tests that test redis blocking operations that are somewhat
 slow.  If you want to skip these tests during day to day development,
 they have all been tagged as 'slow' so you can skip them by running::
 
-    pytest -m "not slow" test_fakeredis.py
+    pytest -m "not slow"
 
 
 Revision history
 ================
+
+1.4.1
+-----
+- `#268 <https://github.com/jamesls/fakeredis/pull/268>`_ Support redis-py 3.5
+  (no code changes, just setup.py)
+
+1.4.0
+-----
+- Add support for aioredis.
+- Fix interaction of no-op SREM with WATCH.
+
+1.3.1
+-----
+- Make errors from Lua behave more like real redis
+
+1.3.0
+-----
+- `#266 <https://github.com/jamesls/fakeredis/pull/266>`_ Implement redis.log in Lua
+
+1.2.1
+-----
+- `#262 <https://github.com/jamesls/fakeredis/issues/262>`_ Cannot repr redis object without host attribute
+- Fix a bug in the hypothesis test framework that occasionally caused a failure
+
+1.2.0
+-----
+- Drop support for Python 2.7.
+- Test with Python 3.8 and Pypy3.
+- Refactor Hypothesis-based tests to support the latest version of Hypothesis.
+- Fix a number of bugs in the Hypothesis tests that were causing spurious test
+  failures or hangs.
+- Fix some obscure corner cases
+
+  - If a WATCHed key is MOVEd, don't invalidate the transaction.
+  - Some cases of passing a key of the wrong type to SINTER/SINTERSTORE were
+    not reporting a WRONGTYPE error.
+  - ZUNIONSTORE/ZINTERSTORE could generate different scores from real redis
+    in corner cases (mostly involving infinities).
+
+- Speed up the implementation of BINCOUNT.
+
+1.1.1
+-----
+- Support redis-py 3.4.
+
+1.1.0
+-----
+- `#257 <https://github.com/jamesls/fakeredis/pull/257>`_ Add other inputs for redis connection
 
 1.0.5
 -----
